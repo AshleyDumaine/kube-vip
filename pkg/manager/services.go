@@ -86,10 +86,12 @@ func (sm *Manager) syncServices(service *v1.Service, wg *sync.WaitGroup) error {
 	newServiceAddress := service.Spec.LoadBalancerIP
 	newServiceUID := string(service.UID)
 
+	var idx int
 	for x := range sm.serviceInstances {
 		if sm.serviceInstances[x].UID == newServiceUID {
 			// We have found this instance in the manager, we can determine if it needs updating
 			foundInstance = true
+			idx = x
 		}
 
 	}
@@ -112,70 +114,73 @@ func (sm *Manager) syncServices(service *v1.Service, wg *sync.WaitGroup) error {
 		VIPCIDR:    sm.config.VIPCIDR,
 	}
 
+	// Create new service
+	var newService Instance
+	newService.UID = newServiceUID
+	newService.Vip = newServiceAddress
+	newService.Type = string(service.Spec.Ports[0].Protocol) //TODO - support multiple port types
+	newService.Port = service.Spec.Ports[0].Port
+	newService.ServiceName = service.Name
+	newService.dhcpInterfaceHwaddr = service.Annotations[hwAddrKey]
+	newService.dhcpInterfaceIP = service.Annotations[requestedIP]
+
+	// If this was purposely created with the address 0.0.0.0 then we will create a macvlan on the main interface and try DHCP
+	if newServiceAddress == "0.0.0.0" {
+		err := sm.createDHCPService(newServiceUID, &newVip, &newService, service)
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
+	log.Infof("New VIP [%s] for [%s/%s] ", newService.Vip, newService.ServiceName, newService.UID)
+
+	// Generate Load Balancer config
+	newLB := kubevip.LoadBalancer{
+		Name:	  fmt.Sprintf("%s-load-balancer", newService.ServiceName),
+		Port:	  int(newService.Port),
+		Type:	  newService.Type,
+		BindToVip: true,
+	}
+
+	// Add Load Balancer Configuration
+	newVip.LoadBalancers = append(newVip.LoadBalancers, newLB)
+
+	// Create Add configuration to the new service
+	newService.vipConfig = newVip
+
+	// TODO - start VIP
+	c, err := cluster.InitCluster(&newService.vipConfig, false)
+	if err != nil {
+		log.Errorf("Failed to add Service [%s] / [%s]", newService.ServiceName, newService.UID)
+		return err
+	}
+	err = c.StartLoadBalancerService(&newService.vipConfig, sm.bgpServer)
+	if err != nil {
+		log.Errorf("Failed to add Service [%s] / [%s]", newService.ServiceName, newService.UID)
+		return err
+	}
+
+	sm.upnpMap(newService)
+
+	newService.cluster = *c
+
+	// Begin watching this service
+	// TODO - we may need this
+	// go sm.serviceWatcher(&newService, sm.config.Namespace)
+
+	// Update the "Status" of the LoadBalancer (one or many may do this), as long as one does it
+	service.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{{IP: newVip.VIP}}
+	_, err = sm.clientSet.CoreV1().Services(service.Namespace).UpdateStatus(context.TODO(), service, metav1.UpdateOptions{})
+	if err != nil {
+		log.Errorf("Error updating Service [%s] Status: %v", newService.ServiceName, err)
+	}
+
 	// This instance wasn't found, we need to add it to the manager
 	if !foundInstance {
-		// Create new service
-		var newService Instance
-		newService.UID = newServiceUID
-		newService.Vip = newServiceAddress
-		newService.Type = string(service.Spec.Ports[0].Protocol) //TODO - support multiple port types
-		newService.Port = service.Spec.Ports[0].Port
-		newService.ServiceName = service.Name
-		newService.dhcpInterfaceHwaddr = service.Annotations[hwAddrKey]
-		newService.dhcpInterfaceIP = service.Annotations[requestedIP]
-
-		// If this was purposely created with the address 0.0.0.0 then we will create a macvlan on the main interface and try DHCP
-		if newServiceAddress == "0.0.0.0" {
-			err := sm.createDHCPService(newServiceUID, &newVip, &newService, service)
-			if err != nil {
-				return err
-			}
-			return nil
-		}
-
-		log.Infof("New VIP [%s] for [%s/%s] ", newService.Vip, newService.ServiceName, newService.UID)
-
-		// Generate Load Balancer config
-		newLB := kubevip.LoadBalancer{
-			Name:      fmt.Sprintf("%s-load-balancer", newService.ServiceName),
-			Port:      int(newService.Port),
-			Type:      newService.Type,
-			BindToVip: true,
-		}
-
-		// Add Load Balancer Configuration
-		newVip.LoadBalancers = append(newVip.LoadBalancers, newLB)
-
-		// Create Add configuration to the new service
-		newService.vipConfig = newVip
-
-		// TODO - start VIP
-		c, err := cluster.InitCluster(&newService.vipConfig, false)
-		if err != nil {
-			log.Errorf("Failed to add Service [%s] / [%s]", newService.ServiceName, newService.UID)
-			return err
-		}
-		err = c.StartLoadBalancerService(&newService.vipConfig, sm.bgpServer)
-		if err != nil {
-			log.Errorf("Failed to add Service [%s] / [%s]", newService.ServiceName, newService.UID)
-			return err
-		}
-
-		sm.upnpMap(newService)
-
-		newService.cluster = *c
-
-		// Begin watching this service
-		// TODO - we may need this
-		// go sm.serviceWatcher(&newService, sm.config.Namespace)
-
-		// Update the "Status" of the LoadBalancer (one or many may do this), as long as one does it
-		service.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{{IP: newVip.VIP}}
-		_, err = sm.clientSet.CoreV1().Services(service.Namespace).UpdateStatus(context.TODO(), service, metav1.UpdateOptions{})
-		if err != nil {
-			log.Errorf("Error updating Service [%s] Status: %v", newService.ServiceName, err)
-		}
 		sm.serviceInstances = append(sm.serviceInstances, newService)
+	} else {
+		sm.serviceInstances[idx] = newService
 	}
 
 	log.Debugf("[COMPLETE] Service Sync")
